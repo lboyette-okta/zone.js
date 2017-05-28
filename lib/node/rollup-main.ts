@@ -7,6 +7,8 @@
  */
 
 import '../zone';
+import '../node_async_check';
+import '../node_asynchooks';
 import '../common/promise';
 import '../common/to-string';
 import './node';

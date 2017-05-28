@@ -12,6 +12,8 @@ import './custom_error';
 
 // Setup tests for Zone without microtask support
 import '../lib/zone';
+import '../lib/node/node_async_check';
+import '../lib/node/node_asynchooks';
 import '../lib/common/promise';
 import '../lib/common/to-string';
 import '../lib/node/node';

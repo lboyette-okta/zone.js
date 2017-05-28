@@ -313,6 +313,12 @@ interface ZoneType {
 type _PatchFn = (global: Window, Zone: ZoneType, api: _ZonePrivate) => void;
 
 /** @internal */
+interface BeforeRunTaskStatus {
+  reEntryGuard: boolean;
+  previousTask: Task;
+}
+
+/** @internal */
 interface _ZonePrivate {
   currentZoneFrame: () => _ZoneFrame;
   symbol: (name: string) => string;
@@ -323,6 +329,8 @@ interface _ZonePrivate {
   patchEventTargetMethods:
       (obj: any, addFnName?: string, removeFnName?: string, metaCreator?: any) => boolean;
   patchOnProperties: (obj: any, properties: string[]) => void;
+  beforeRunTask: (zone: Zone, task: Task) => BeforeRunTaskStatus;
+  afterRunTask: (zone: Zone, beforeRunTaskStatus: BeforeRunTaskStatus, task: Task) => void;
 }
 
 /** @internal */
@@ -757,8 +765,7 @@ const Zone: ZoneType = (function(global: any) {
       }
     }
 
-
-    runTask(task: Task, applyThis?: any, applyArgs?: any): any {
+    beforeRunTask(task: Task) {
       if (task.zone != this) {
         throw new Error(
             'A task can only be run in the zone of creation! (Creation: ' +
@@ -772,7 +779,7 @@ const Zone: ZoneType = (function(global: any) {
       // typescript compiler will complain below
       const isNotScheduled = task.state === notScheduled;
       if (isNotScheduled && task.type === eventTask) {
-        return;
+        return null;
       }
 
       const reEntryGuard = task.state != running;
@@ -781,6 +788,33 @@ const Zone: ZoneType = (function(global: any) {
       const previousTask = _currentTask;
       _currentTask = task;
       _currentZoneFrame = {parent: _currentZoneFrame, zone: this};
+      //(process as any)._rawDebug('currentFrame increase ', _currentZoneFrame && _currentZoneFrame.zone.name, task.source);
+      return {
+        reEntryGuard: reEntryGuard,
+        previousTask: previousTask
+      }
+    }
+
+    afterRunTask(beforeRunTaskStatus: BeforeRunTaskStatus, task: Task) {
+      // if the task's state is notScheduled or unknown, then it has already been cancelled
+      // we should not reset the state to scheduled
+      if (task.state !== notScheduled && task.state !== unknown) {
+        if (task.type == eventTask || (task.data && task.data.isPeriodic)) {
+          beforeRunTaskStatus.reEntryGuard && (task as ZoneTask<any>)._transitionTo(scheduled, running);
+        } else {
+          task.runCount = 0;
+          this._updateTaskCount(task as ZoneTask<any>, -1);
+          beforeRunTaskStatus.reEntryGuard &&
+            (task as ZoneTask<any>)._transitionTo(notScheduled, running, notScheduled);
+        }
+      }
+      _currentZoneFrame = _currentZoneFrame.parent;
+      //(process as any)._rawDebug('currentFrame decrease ', _currentZoneFrame && _currentZoneFrame.zone.name, task.source);
+      _currentTask = beforeRunTaskStatus.previousTask;
+    }
+
+    runTask(task: Task, applyThis?: any, applyArgs?: any): any {
+      const beforeRunTaskStatus = this.beforeRunTask(task);
       try {
         if (task.type == macroTask && task.data && !task.data.isPeriodic) {
           task.cancelFn = null;
@@ -793,20 +827,7 @@ const Zone: ZoneType = (function(global: any) {
           }
         }
       } finally {
-        // if the task's state is notScheduled or unknown, then it has already been cancelled
-        // we should not reset the state to scheduled
-        if (task.state !== notScheduled && task.state !== unknown) {
-          if (task.type == eventTask || (task.data && task.data.isPeriodic)) {
-            reEntryGuard && (task as ZoneTask<any>)._transitionTo(scheduled, running);
-          } else {
-            task.runCount = 0;
-            this._updateTaskCount(task as ZoneTask<any>, -1);
-            reEntryGuard &&
-                (task as ZoneTask<any>)._transitionTo(notScheduled, running, notScheduled);
-          }
-        }
-        _currentZoneFrame = _currentZoneFrame.parent;
-        _currentTask = previousTask;
+        this.afterRunTask(beforeRunTaskStatus, task);
       }
     }
 
@@ -1241,10 +1262,13 @@ const Zone: ZoneType = (function(global: any) {
     // we must bootstrap the initial task creation by manually scheduling the drain
     if (_numberOfNestedTaskFrames === 0 && _microTaskQueue.length === 0) {
       // We are not running in Task, so we need to kickstart the microtask queue.
+      // @JiaLiPassion, use native promise if async_hooks is available
       if (global[symbolPromise]) {
         global[symbolPromise].resolve(0)[symbolThen](drainMicroTaskQueue);
-      } else {
+      } else if (global[symbolSetTimeout]) {
         global[symbolSetTimeout](drainMicroTaskQueue, 0);
+      } else {
+        Promise.resolve(0).then(drainMicroTaskQueue);
       }
     }
     task && _microTaskQueue.push(task);
@@ -1294,7 +1318,13 @@ const Zone: ZoneType = (function(global: any) {
     scheduleMicroTask: scheduleMicroTask,
     showUncaughtError: () => !(Zone as any)[__symbol__('ignoreConsoleErrorUncaughtError')],
     patchEventTargetMethods: () => false,
-    patchOnProperties: noop
+    patchOnProperties: noop,
+    beforeRunTask: (zone: Zone, task: Task) => {
+      return zone.beforeRunTask(task);
+    },
+    afterRunTask: (zone: Zone, beforeRunTaskStatus: BeforeRunTaskStatus, task: Task) => {
+      return zone.afterRunTask(beforeRunTaskStatus, task);
+    }
   };
   let _currentZoneFrame: _ZoneFrame = {parent: null, zone: new Zone(null, null)};
   let _currentTask: Task = null;
@@ -1305,7 +1335,6 @@ const Zone: ZoneType = (function(global: any) {
   function __symbol__(name: string) {
     return '__zone_symbol__' + name;
   }
-
 
   performanceMeasure('Zone', 'Zone');
   return global['Zone'] = Zone;
